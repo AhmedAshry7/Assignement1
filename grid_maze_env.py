@@ -1,13 +1,19 @@
+# grid_with_policy_iteration.py
 import gymnasium as gym
 from gymnasium import spaces
-from gymnasium.wrappers import RecordVideo
 import numpy as np
 import pygame
 import random
 import itertools
-from tabular_policy import TabularPolicy
-from tabular_value_function import TabularValueFunction
-from qtable import QTable
+import math
+from typing import Any, Dict, List, Optional, Tuple
+import pickle
+import time 
+
+# -------------------
+# Gym environment
+# -------------------
+
 
 class GridMazeEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 4}
@@ -21,12 +27,17 @@ class GridMazeEnv(gym.Env):
         # Define action space: up, right, down, left
         self.action_space = spaces.Discrete(4)
 
-        # Observation space: agent position (row, col)
-        self.observation_space = spaces.Box(
-            low=0, high=grid_size - 1, shape=(2,), dtype=np.int32
+        # Observation space: {agent:Box(2), goal:Box(2), walls: MultiBinary grid or list}
+        self.observation_space = spaces.Dict(
+            {
+                "agent": spaces.Box(low=0, high=grid_size - 1, shape=(2,), dtype=np.int32),
+                "goal": spaces.Box(low=0, high=grid_size - 1, shape=(2,), dtype=np.int32),
+                # walls: exactly two wall coordinates as ints
+                "walls": spaces.Box(low=0, high=grid_size - 1, shape=(2, 2), dtype=np.int32),
+            }
         )
 
-        # Initialize pygame
+        # Initialize pygame for human render
         if render_mode == "human":
             pygame.init()
             self.cell_size = 100
@@ -39,38 +50,42 @@ class GridMazeEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.agent_pos = np.array((random.randint(0, self.grid_size - 1), random.randint(0, self.grid_size - 1)))
-        self.goal_pos = np.array((random.randint(0, self.grid_size - 1), random.randint(0, self.grid_size - 1))) 
+        # agent_pos and goal_pos are (row, col)
+        self.agent_pos = np.array(
+            (random.randint(0, self.grid_size - 1), random.randint(0, self.grid_size - 1))
+        )
+        self.goal_pos = np.array(
+            (random.randint(0, self.grid_size - 1), random.randint(0, self.grid_size - 1))
+        )
 
         while np.array_equal(self.goal_pos, self.agent_pos):
-            self.goal_pos = np.array((random.randint(0, self.grid_size - 1), random.randint(0, self.grid_size - 1)))
-
-        # Random walls
-        self.walls = []
-        while len(self.walls) < 2:
-            wall = (
-                random.randint(0, self.grid_size - 1),
-                random.randint(0, self.grid_size - 1)
+            self.goal_pos = np.array(
+                (random.randint(0, self.grid_size - 1), random.randint(0, self.grid_size - 1))
             )
 
-            # Make sure wall doesn't overlap with agent, goal, or existing walls
-            if (
-                wall != tuple(self.agent_pos)
-                and wall != tuple(self.goal_pos)
-                and wall not in self.walls
-            ):
+        # Exactly two walls (as in your GridWorld MDP assumption)
+        self.walls = []
+        while len(self.walls) < 2:
+            wall = (random.randint(0, self.grid_size - 1), random.randint(0, self.grid_size - 1))
+            if wall != tuple(self.agent_pos) and wall != tuple(self.goal_pos) and wall not in self.walls:
                 self.walls.append(wall)
 
-        obervation = (self.agent_pos.copy(),self.goal_pos.copy(),list(self.walls))
-        return obervation, {}
+        observation = {
+            "agent": self.agent_pos.copy(),
+            "goal": self.goal_pos.copy(),
+            "walls": np.array(self.walls, dtype=np.int32),
+        }
+
+        return observation, {}
 
     def step(self, action):
-        # Add stochasticity (e.g., 30% chance to take a random move)
+        # Add stochasticity (30% slip total: 15% left, 15% right)
         stochasticity = np.random.rand()
-        if  stochasticity< 0.15:
-            action = (action-1)%4
-        elif  stochasticity< 0.3:
-            action = (action+1)%4
+        if stochasticity < 0.15:
+            action = (action - 1) % 4
+        elif stochasticity < 0.3:
+            action = (action + 1) % 4
+
         move_map = {
             0: np.array([-1, 0]),  # up
             1: np.array([0, 1]),   # right
@@ -78,21 +93,33 @@ class GridMazeEnv(gym.Env):
             3: np.array([0, -1]),  # left
         }
 
-        new_pos = self.agent_pos + move_map[action]
+        candidate = self.agent_pos + move_map[action]
 
-        # Check boundaries and walls
+        # clamp / bounce: if out of bounds stay in place
+        if candidate[0] < 0 or candidate[0] >= self.grid_size or candidate[1] < 0 or candidate[1] >= self.grid_size:
+            new_pos = self.agent_pos.copy()
+        else:
+            new_pos = candidate
+
         self.agent_pos = new_pos
-        if (tuple(new_pos) in self.walls):
-            reward = -1  # Penalty for hitting a wall
-            terminated=True
+
+        if tuple(new_pos) in self.walls:
+            reward = -1.0
+            terminated = True
         else:
             terminated = np.array_equal(self.agent_pos, self.goal_pos)
             reward = 1.0 if terminated else -0.01
-        
-        obervation = (self.agent_pos.copy(),self.goal_pos.copy(),list(self.walls))
-        return obervation, reward, terminated, False, {}
 
-    def render(self):
+        observation = {
+            "agent": self.agent_pos.copy(),
+            "goal": self.goal_pos.copy(),
+            "walls": np.array(self.walls, dtype=np.int32),
+        }
+        truncated = False
+        info = {}
+        return observation, reward, terminated, truncated, info
+
+    def render(self, action):
         if self.render_mode != "human":
             return
 
@@ -108,19 +135,49 @@ class GridMazeEnv(gym.Env):
                 pygame.draw.rect(self.screen, (0, 0, 0), rect, 2)
 
         # Draw agent
-        ar, ac = self.agent_pos
+        ar, ac = int(self.agent_pos[0]), int(self.agent_pos[1])
         pygame.draw.circle(
             self.screen, (0, 0, 255),
             (ac * self.cell_size + self.cell_size // 2, ar * self.cell_size + self.cell_size // 2),
             self.cell_size // 4
         )
 
+        if (action is not None):
+            move_map = {
+                0: (-1, 0),  # up
+                1: (0, 1),   # right
+                2: (1, 0),   # down
+                3: (0, -1),  # left
+            }
+
+
+            # Compute the center of the agent cell in pixels
+            start_x = ac * self.cell_size + self.cell_size // 2
+            start_y = ar * self.cell_size + self.cell_size // 2
+
+            # Compute end point offset in pixels (half cell in the chosen direction)
+            dy, dx = move_map[action]
+            end_x = start_x + dx * 1.25 * self.cell_size // 2
+            end_y = start_y + dy * 1.25 * self.cell_size // 2
+
+            pygame.draw.line(
+                self.screen,
+                (255, 0, 0),  # red
+                (start_x, start_y),
+                (end_x, end_y),
+                width=8,
+            )
+
+            pygame.draw.circle(self.screen, (255, 0, 0), (end_x, end_y), 6)
+
         # Draw goal
-        gr, gc = self.goal_pos
+        gr, gc = int(self.goal_pos[0]), int(self.goal_pos[1])
         pygame.draw.rect(
             self.screen, (0, 255, 0),
             pygame.Rect(gc * self.cell_size + 20, gr * self.cell_size + 20, self.cell_size - 40, self.cell_size - 40)
         )
+
+
 
         pygame.display.flip()
 
@@ -128,62 +185,41 @@ class GridMazeEnv(gym.Env):
         if self.render_mode == "human":
             pygame.quit()
 
+
+# -------------------
+# MDP abstract interface and GridWorld MDP
+# -------------------
 class MDP:
-    """ Return all states of this MDP """
     def get_states(self):
-        abstract
+        raise NotImplementedError
 
-    """ Return all actions with non-zero probability from this state """
     def get_actions(self, state):
-        abstract
+        raise NotImplementedError
 
-    """ Return all non-zero probability transitions for this action
-        from this state, as a list of (state, probability) pairs
-    """
     def get_transitions(self, state, action):
-        abstract
+        raise NotImplementedError
 
-    """ Return the reward for transitioning from state to
-        nextState via action
-    """
     def get_reward(self, state, action, next_state):
-        abstract
+        raise NotImplementedError
 
-    """ Return true if and only if state is a terminal state of this MDP """
-    def is_terminal(self, state):
-        abstract
-
-    """ Return the discount factor for this MDP """
-    def get_discount_factor(self):
-        abstract
-
-    """ Return the initial state of this MDP """
-    def get_initial_state(self):
-        abstract
-
-    """ Return all goal states of this MDP """
-    def get_goal_states(self):
-        abstract
 
 class GridWorld(MDP):
+    """
+    MDP states are tuples:
+        (ax, ay, gx, gy, b1x, b1y, b2x, b2y)
+    where (ax,ay) is the agent, (gx,gy) the goal and b1,b2 the two bad cells.
+    """
 
-    def __init__(self,env):
+    def __init__(self, env: GridMazeEnv):
+        # store grid sizes
         self.width = env.grid_size
         self.height = env.grid_size
-        # flattened cell indices 0..(width*height-1)
         self.n_cells = env.grid_size * env.grid_size
-        # precompute coords list so we map index->(x,y) fast
         self._coords = [(x, y) for x in range(env.grid_size) for y in range(env.grid_size)]
 
-    """ Return all states of this MDP """
     def get_states(self):
-        """
-        Return a list of all valid states.
-        State representation: (ax, ay, gx, gy, b1x, b1y, b2x, b2y)
-        We require the 4 cells (agent, goal, bad1, bad2) to be distinct.
-        """
-        states = []
-        # iterate over all permutations of 4 distinct cell indices
+        states: List[Tuple[int, ...]] = []
+        # iterate over permutations of 4 distinct cell indices
         for agent_idx, goal_idx, bad1_idx, bad2_idx in itertools.permutations(range(self.n_cells), 4):
             ax, ay = self._coords[agent_idx]
             gx, gy = self._coords[goal_idx]
@@ -192,316 +228,240 @@ class GridWorld(MDP):
             states.append((ax, ay, gx, gy, b1x, b1y, b2x, b2y))
         return states
 
-    """ Return all actions with non-zero probability from this state """
     def get_actions(self, state):
-        actions=[0,1,2,3] # up, right, down, left
+        actions = [0, 1, 2, 3]  # up, right, down, left
         ax, ay = state[0], state[1]
-
-        # Check grid boundaries
-        if ax == 0:  # top edge → can't move up
-            actions.remove(0)
-        if ax == self.grid_size - 1:  # bottom edge → can't move down
-            actions.remove(2)
-        if ay == 0:  # left edge → can't move left
-            actions.remove(3)
-        if ay == self.grid_size - 1:  # right edge → can't move right
-            actions.remove(1)
-        
+        if ax == 0:  # top edge => can't move up
+            if 0 in actions: actions.remove(0)
+        if ax == self.height - 1:  # bottom edge => can't move down
+            if 2 in actions: actions.remove(2)
+        if ay == 0:  # left edge => can't move left
+            if 3 in actions: actions.remove(3)
+        if ay == self.width - 1:  # right edge => can't move right
+            if 1 in actions: actions.remove(1)
         return actions
 
-
-    def get_transitions(self,env, state, action):
-        transitions = []
-
-        # Probability of not slipping left or right
-        # Add stochasticity (e.g., 30% chance to take a random move)
+    def get_transitions(self, state, action):
+        """
+        Return list of (next_state, prob) based on slip model.
+        Doesn't use an env object; only the state tuple.
+        """
+        ax, ay, gx, gy, b1x, b1y, b2x, b2y = state
 
         move_map = {
-            0: np.array([-1, 0]),  # up
-            1: np.array([0, 1]),   # right
-            2: np.array([1, 0]),   # down
-            3: np.array([0, -1]),  # left
+            0: (-1, 0),  # up
+            1: (0, 1),   # right
+            2: (1, 0),   # down
+            3: (0, -1),  # left
         }
-        new_pos = env.agent_pos + move_map[action]
-        new_pos1 = env.agent_pos + move_map[(action-1)%4]
-        new_pos2 = env.agent_pos + move_map[(action+1)%4]
-        transitions += [(new_pos, 0.7)]
-        transitions += [(new_pos1, 0.15)]
-        transitions += [(new_pos2, 0.15)]
 
+        def apply_move(x, y, move):
+            dx, dy = move
+            nx, ny = x + dx, y + dy
+            # if out of bounds, stay in place
+            if nx < 0 or nx >= self.height or ny < 0 or ny >= self.width:
+                return x, y
+            return nx, ny
+
+        intended = apply_move(ax, ay, move_map[action])
+        left = apply_move(ax, ay, move_map[(action - 1) % 4])
+        right = apply_move(ax, ay, move_map[(action + 1) % 4])
+
+        prob_map = {}
+        for pos, p in [(intended, 0.7), (left, 0.15), (right, 0.15)]:
+            prob_map[pos] = prob_map.get(pos, 0.0) + p
+
+        transitions = []
+        for (nx, ny), p in prob_map.items():
+            next_state = (nx, ny, gx, gy, b1x, b1y, b2x, b2y)
+            transitions.append((next_state, p))
         return transitions
 
-    def get_reward(self, state,env, action):
-        reward = 0.0
-        if np.array_equal(env.goal_pos, env.agent_pos):
-            reward = 1
-        elif tuple(env.agent_pos) in env.walls:
-            reward = -1
-        else:
-            reward = -0.01
-        return reward
+    def get_reward(self, state, action, next_state):
+        nax, nay = next_state[0], next_state[1]
+        _, _, gx, gy, b1x, b1y, b2x, b2y = next_state
+        if (nax, nay) == (gx, gy):
+            return 1.0
+        if (nax, nay) == (b1x, b1y) or (nax, nay) == (b2x, b2y):
+            return -1.0
+        return -0.01
+    
+    def is_terminal(self, state):
+        ax, ay, gx, gy, b1x, b1y, b2x, b2y = state
+        if (ax, ay) == (gx, gy): return True
+        if (ax, ay) == (b1x, b1y) or (ax, ay) == (b2x, b2y): return True
+        return False
+
+
+# -------------------
+# PolicyIteration (keeps internal transition/reward model compatible with GridWorld)
+# -------------------
+State = Tuple[int, int, int, int, int, int, int, int]
+Action = int
 
 
 class PolicyIteration:
-    def __init__(self, mdp, policy):
+    def __init__(self, mdp: MDP, gamma: float = 0.99, theta: float = 1e-6):
         self.mdp = mdp
-        self.policy = policy
-
-    def policy_evaluation(self, policy, values, theta=0.001):
-
-        while True:
-            delta = 0.0
-            new_values = TabularValueFunction()
-            for state in self.mdp.get_states():
-                # Calculate the value of V(s)
-                actions = self.mdp.get_actions(state)
-                old_value = values.get_value(state)
-                new_value = values.get_q_value(
-                    self.mdp, state, policy.select_action(state, actions)
-                )
-                values.add(state, new_value)
-                delta = max(delta, abs(old_value - new_value))
-
-            # terminate if the value function has converged
-            if delta < theta:
-                break
-
-        return values
-
-    """ Implmentation of policy iteration iteration. Returns the number of iterations executed """
-
-    def policy_iteration(self, max_iterations=100, theta=0.001):
-
-        # create a value function to hold details
-        values = TabularValueFunction()
-
-        for i in range(1, max_iterations + 1):
-            policy_changed = False
-            values = self.policy_evaluation(self.policy, values, theta)
-            for state in self.mdp.get_states():
-
-                actions = self.mdp.get_actions(state)
-                old_action = self.policy.select_action(state, actions)
-
-                q_values = QTable(alpha=1.0)
-                for action in self.mdp.get_actions(state):
-                    # Calculate the value of Q(s,a)
-                    new_value = values.get_q_value(self.mdp, state, action)
-                    q_values.update(state, action, new_value)
-                # V(s) = argmax_a Q(s,a)
-                new_action = q_values.get_argmax_q(state, self.mdp.get_actions(state))
-                self.policy.update(state, new_action)
-                policy_changed = (
-                    True if new_action is not old_action else policy_changed
-                )
-
-            if not policy_changed:
-                return i
-
-        return max_iterations
-
-
-import math
-import random
-from typing import Any, Dict, List, Tuple, Optional
-
-class PolicyIteration:
-    """
-    Policy Iteration for a generic MDP.
-    mdp: object exposing get_states(), get_actions(state), get_transitions(...) and get_reward(...)
-    env: optional environment passed to mdp methods if required (some implementations expect env as 1st arg)
-    gamma: discount factor
-    theta: evaluation stopping tolerance
-    max_eval_iters: max iterations for policy evaluation
-    """
-
-    def __init__(self, mdp: Any, env: Any = None, gamma: float = 0.99,
-                 theta: float = 1e-6, max_eval_iters: int = 10000):
-        self.mdp = mdp
-        self.env = env
         self.gamma = gamma
         self.theta = theta
-        self.max_eval_iters = max_eval_iters
 
-        # states and initial structures
-        self.states = list(self.mdp.get_states())
-        self.V: Dict[Any, float] = {s: 0.0 for s in self.states}
-        # deterministic policy: state -> action
-        self.policy: Dict[Any, Any] = {}
-        self._init_random_policy()
-
-    def _init_random_policy(self):
-        """Initialize with a random valid action for each state (deterministic)"""
+        self.states: List[State] = list(self.mdp.get_states())
+        self.V: Dict[State, float] = {s: 0.0 for s in self.states}
+        self.policy: Dict[State, Optional[Action]] = {}
         for s in self.states:
-            actions = self._safe_get_actions(s)
-            if not actions:
-                # terminal or no action states
-                self.policy[s] = None
-            else:
-                self.policy[s] = random.choice(actions)
+            actions = self.mdp.get_actions(s)
+            self.policy[s] = actions[0] if actions else None
 
-    # --- wrappers to adapt to various mdp method signatures ---
-    def _safe_get_actions(self, state):
-        try:
-            return self.mdp.get_actions(state)
-        except TypeError:
-            # maybe signature is get_actions(env, state)
-            return self.mdp.get_actions(self.env, state)
-
-    def _safe_get_transitions(self, state, action) -> List[Tuple[Any, float]]:
-        """
-        Returns list of (next_state, prob).
-        Tries common signatures: get_transitions(state, action) or get_transitions(env, state, action)
-        """
-        # call and then normalize next_state representation (e.g., numpy -> tuple)
-        try:
-            trans = self.mdp.get_transitions(state, action)
-        except TypeError:
-            trans = self.mdp.get_transitions(self.env, state, action)
-
-        # trans may be list of (next_pos, prob) or (next_state, prob)
-        normed = []
-        for (ns, p) in trans:
-            ns_key = self._state_key(ns)
-            normed.append((ns_key, float(p)))
-        return normed
-
-    def _safe_get_reward(self, state, action, next_state) -> float:
-        """
-        Tries multiple possible reward signatures:
-         - get_reward(state, action, next_state)
-         - get_reward(state, env, action)  (as in given GridWorld)
-         - get_reward(state, action)
-        """
-        # try most informative signature first
-        try:
-            return float(self.mdp.get_reward(state, action, next_state))
-        except TypeError:
-            pass
-        try:
-            # gridworld-like signature: get_reward(state, env, action)
-            return float(self.mdp.get_reward(state, self.env, action))
-        except TypeError:
-            pass
-        try:
-            return float(self.mdp.get_reward(state, action))
-        except TypeError:
-            # fallback: zero reward if nothing matches
-            return 0.0
-
-    def _state_key(self, s):
-        """Convert possible numpy arrays or lists to hashable tuple keys"""
-        try:
-            # numpy arrays have .tolist()
-            if hasattr(s, "tolist"):
-                return tuple(s.tolist())
-            # lists -> tuple
-            if isinstance(s, list):
-                return tuple(s)
-            # already a tuple or hashable
-            return s
-        except Exception:
-            return s
-
-    # --- policy evaluation (iterative) ---
-    def policy_evaluation(self):
-        """
-        Iteratively evaluate current self.policy and update self.V in-place.
-        Uses the equation:
-        V(s) <- sum_{a} pi(a|s) sum_{s'} P(s'|s,a) [ R(s,a,s') + gamma * V(s') ]
-        But since policy here is deterministic, we evaluate for the single action pi(s).
-        """
-        for it in range(self.max_eval_iters):
+    def policy_evaluation(self) -> None:
+        while True:
             delta = 0.0
-            new_V = dict(self.V)  # compute updates into new_V then assign
             for s in self.states:
-                a = self.policy.get(s)
-                if a is None:
-                    # terminal/no-action state
-                    new_v = 0.0
-                else:
-                    # sum over next states
-                    total = 0.0
-                    transitions = self._safe_get_transitions(s, a)
-                    if not transitions:
-                        new_v = 0.0
-                    else:
-                        for s_next, prob in transitions:
-                            r = self._safe_get_reward(s, a, s_next)
-                            v_next = self.V.get(s_next, 0.0)
-                            total += prob * (r + self.gamma * v_next)
-                        new_v = total
-                delta = max(delta, abs(new_v - self.V.get(s, 0.0)))
-                new_V[s] = new_v
-            self.V = new_V
+                if self.mdp.is_terminal(s):
+                    continue
+                pi_a = self.policy.get(s)
+                if pi_a is None:
+                    continue
+                v_old = self.V[s]
+                new_v = 0.0
+                a = pi_a
+                transitions = self.mdp.get_transitions(s, a)
+                for s_next, p in transitions:
+                    r = self.mdp.get_reward(s, a, s_next)
+                    new_v += p * (r + self.gamma * self.V.get(s_next, 0.0))
+                self.V[s] = new_v
+                delta = max(delta, abs(v_old - new_v))
             if delta < self.theta:
-                # converged
                 break
 
-    # --- policy improvement (greedy) ---
     def policy_improvement(self) -> bool:
-        """
-        Make policy greedy wrt current value function V.
-        Returns True if policy changed (so another iteration is required).
-        """
         policy_stable = True
         for s in self.states:
-            actions = self._safe_get_actions(s)
+            if self.mdp.is_terminal(s):
+                continue
+            old_action = self.policy.get(s)
+            actions = self.mdp.get_actions(s)
             if not actions:
                 self.policy[s] = None
                 continue
-
-            # compute action-values
             best_a = None
             best_q = -math.inf
             for a in actions:
                 q = 0.0
-                transitions = self._safe_get_transitions(s, a)
-                for s_next, prob in transitions:
-                    r = self._safe_get_reward(s, a, s_next)
-                    v_next = self.V.get(s_next, 0.0)
-                    q += prob * (r + self.gamma * v_next)
-                # break ties deterministically by action order (first encountered)
+                transitions = self.mdp.get_transitions(s, a)
+                for s_next, p in transitions:
+                    r = self.mdp.get_reward(s, a, s_next)
+                    q += p * (r + self.gamma * self.V.get(s_next, 0.0))
                 if q > best_q:
                     best_q = q
                     best_a = a
-
-            if best_a is None:
-                best_a = actions[0]
-
-            if self.policy.get(s) != best_a:
+            self.policy[s] = best_a
+            if old_action != best_a:
                 policy_stable = False
-                self.policy[s] = best_a
+        return policy_stable
 
-        return not policy_stable  # return True when changed (need another outer loop)
-
-    # --- top-level policy iteration ---
-    def run(self, max_iterations: int = 1000) -> Tuple[Dict[Any, Any], Dict[Any, float]]:
-        """
-        Run full policy iteration until policy is stable or max_iterations reached.
-        Returns (policy, V)
-        """
+    def run(self, max_iterations: int = 1000) -> Tuple[Dict[State, Optional[Action]], Dict[State, float]]:
         for i in range(max_iterations):
             self.policy_evaluation()
-            changed = self.policy_improvement()
-            if not changed:
-                # policy is stable -> done
+            stable = self.policy_improvement()
+            if stable:
+                print(i)
                 break
         return self.policy, self.V
 
-# ---------------------------
-# Example usage (pseudocode):
-#
-# from your_module import GridWorld, Env
-# env = Env(grid_size=4, ...)      # your environment instance
-# mdp = GridWorld(env)
-# pi = PolicyIteration(mdp, env=env, gamma=0.99)
-# policy, V = pi.run()
-#
-# policy is a dict mapping states to chosen action (0/1/2/3 in your GridWorld).
-# V is a dict mapping states to values.
-#
-# NOTE: If your mdp.get_transitions returns positions (like numpy arrays) rather than
-# complete state tuples, make sure transitions return full next-state descriptions that
-# match items from mdp.get_states(). The wrapper tries to convert arrays->tuples,
-# but the semantics must match your MDP state's structure.
+    # -------------------
+    # New: save / load and run a single episode using learned policy
+    # -------------------
+    def save_model(self, filepath: str) -> None:
+        """Save learned policy and value function to a file using pickle."""
+        with open(filepath, "wb") as f:
+            pickle.dump({"policy": self.policy, "V": self.V}, f)
+
+    def load_model(self, filepath: str) -> None:
+        """Load policy and value function from file and replace current policy/V."""
+        with open(filepath, "rb") as f:
+            data = pickle.load(f)
+        self.policy = data.get("policy", {})
+        self.V = data.get("V", {})
+
+    def _obs_to_state(self, obs: Any) -> State:
+        """Convert environment observation to MDP state tuple.
+
+        Supports two observation formats used in earlier code variants:
+        - dict with keys 'agent', 'goal', 'walls' (current corrected env)
+        - tuple (agent, goal, walls) where walls is a list of two tuples
+        """
+        # agent and goal
+        if isinstance(obs, dict):
+            agent = obs["agent"]
+            goal = obs["goal"]
+            walls = obs["walls"]
+            # walls might be numpy array shape (2,2) or list of tuples
+            if isinstance(walls, np.ndarray):
+                b1 = tuple(int(x) for x in walls[0])
+                b2 = tuple(int(x) for x in walls[1])
+            else:
+                b1, b2 = walls[0], walls[1]
+        else:
+            # assume tuple (agent, goal, walls)
+            agent, goal, walls = obs
+            if isinstance(walls, np.ndarray):
+                b1 = tuple(int(x) for x in walls[0])
+                b2 = tuple(int(x) for x in walls[1])
+            else:
+                b1, b2 = walls[0], walls[1]
+
+        ax, ay = int(agent[0]), int(agent[1])
+        gx, gy = int(goal[0]), int(goal[1])
+        b1x, b1y = int(b1[0]), int(b1[1])
+        b2x, b2y = int(b2[0]), int(b2[1])
+        return (ax, ay, gx, gy, b1x, b1y, b2x, b2y)
+
+    def run_episode(self, env: GridMazeEnv, max_steps: int = 100, render: bool = False) -> Tuple[float, int]:
+        """Run one episode in the environment following the learned policy.
+
+        Returns (total_reward, steps_taken).
+        If a state encountered isn't in the stored policy mapping, we choose a random legal action.
+        """
+        obs, _ = env.reset()
+        total_reward = 0.0
+        steps = 0
+        for _ in range(max_steps):
+            state = self._obs_to_state(obs)
+            # choose action from policy if available, otherwise random legal action
+            a = self.policy.get(state)
+            action = int(a)
+
+            env.render(a)
+            time.sleep(1)
+
+            obs, reward, terminated, truncated, info = env.step(action)
+            total_reward += reward
+            steps += 1
+            if render and env.render_mode == "human":
+                env.render(None)
+                time.sleep(0.5)
+            if terminated or truncated:
+                break
+        return total_reward, steps
+
+
+# -------------------
+# Example usage
+# -------------------
+if __name__ == "__main__":
+    env = GridMazeEnv(grid_size=5, render_mode="human")
+    mdp = GridWorld(env)
+
+    #solver = PolicyIteration(mdp, gamma=0.99, theta=1e-6)
+    #policy, V = solver.run()
+
+    # save model
+    #solver.save_model("learned_policy.pkl")
+
+    # create a fresh solver, load model and run an episode
+    solver2 = PolicyIteration(mdp, gamma=0.99, theta=1e-6)#
+    solver2.load_model("learned_policy.pkl")
+
+    total_reward, steps = solver2.run_episode(env, max_steps=100, render=True)
+    print(f"Episode finished: total_reward={total_reward}, steps={steps}")
