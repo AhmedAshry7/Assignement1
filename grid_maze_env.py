@@ -104,11 +104,11 @@ class GridMazeEnv(gym.Env):
         self.agent_pos = new_pos
 
         if tuple(new_pos) in self.walls:
-            reward = -1.0
+            reward = -0.75
             terminated = True
         else:
             terminated = np.array_equal(self.agent_pos, self.goal_pos)
-            reward = 1.0 if terminated else -0.01
+            reward = 1 if terminated else -0.1
 
         observation = {
             "agent": self.agent_pos.copy(),
@@ -281,10 +281,10 @@ class GridWorld(MDP):
         nax, nay = next_state[0], next_state[1]
         _, _, gx, gy, b1x, b1y, b2x, b2y = next_state
         if (nax, nay) == (gx, gy):
-            return 1.0
+            return 1
         if (nax, nay) == (b1x, b1y) or (nax, nay) == (b2x, b2y):
-            return -1.0
-        return -0.01
+            return -0.75
+        return -0.1
     
     def is_terminal(self, state):
         ax, ay, gx, gy, b1x, b1y, b2x, b2y = state
@@ -307,7 +307,13 @@ class PolicyIteration:
         self.theta = theta
 
         self.states: List[State] = list(self.mdp.get_states())
-        self.V: Dict[State, float] = {s: 0.0 for s in self.states}
+        def _manhattan(s: State) -> float:
+            ax, ay, gx, gy, *_ = s
+            return ((abs(ax - gx) + abs(ay - gy)) / 40)
+
+
+        # Use negative distance so smaller distance -> larger value
+        self.V: Dict[State, float] = {s: -float(_manhattan(s)) for s in self.states}
         self.policy: Dict[State, Optional[Action]] = {}
         for s in self.states:
             actions = self.mdp.get_actions(s)
@@ -450,18 +456,18 @@ class PolicyIteration:
 # Example usage
 # -------------------
 if __name__ == "__main__":
-    env = GridMazeEnv(grid_size=5, render_mode="human")
+    env = GridMazeEnv(grid_size=5, render_mode=None)
     mdp = GridWorld(env)
 
-    #solver = PolicyIteration(mdp, gamma=0.99, theta=1e-6)
-    #policy, V = solver.run()
+    solver = PolicyIteration(mdp, gamma=0.99, theta=1e-6)
+    policy, V = solver.run()
 
     # save model
-    #solver.save_model("learned_policy.pkl")
+    solver.save_model("learned_policy.pkl")
 
     # create a fresh solver, load model and run an episode
-    solver2 = PolicyIteration(mdp, gamma=0.99, theta=1e-6)#
-    solver2.load_model("learned_policy.pkl")
+    #solver2 = PolicyIteration(mdp, gamma=0.99, theta=1e-6)#
+    #solver2.load_model("learned_policy.pkl")
 
-    total_reward, steps = solver2.run_episode(env, max_steps=100, render=True)
-    print(f"Episode finished: total_reward={total_reward}, steps={steps}")
+    #total_reward, steps = solver2.run_episode(env, max_steps=100, render=True)
+    #print(f"Episode finished: total_reward={total_reward}, steps={steps}")
