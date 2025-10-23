@@ -70,6 +70,7 @@ class GridMazeEnv(gym.Env):
             if wall != tuple(self.agent_pos) and wall != tuple(self.goal_pos) and wall not in self.walls:
                 self.walls.append(wall)
 
+        self.walls.sort() 
         observation = {
             "agent": self.agent_pos.copy(),
             "goal": self.goal_pos.copy(),
@@ -219,13 +220,17 @@ class GridWorld(MDP):
 
     def get_states(self):
         states: List[Tuple[int, ...]] = []
-        # iterate over permutations of 4 distinct cell indices
-        for agent_idx, goal_idx, bad1_idx, bad2_idx in itertools.permutations(range(self.n_cells), 4):
-            ax, ay = self._coords[agent_idx]
-            gx, gy = self._coords[goal_idx]
-            b1x, b1y = self._coords[bad1_idx]
-            b2x, b2y = self._coords[bad2_idx]
-            states.append((ax, ay, gx, gy, b1x, b1y, b2x, b2y))
+        cells = range(self.n_cells)
+
+        # choose 2 distinct bad cell indices (unordered)
+        for agent_idx, goal_idx in itertools.permutations(cells, 2):
+            remaining = set(cells) - {agent_idx, goal_idx}
+            for bad1_idx, bad2_idx in itertools.combinations(remaining, 2):
+                ax, ay = self._coords[agent_idx]
+                gx, gy = self._coords[goal_idx]
+                b1x, b1y = self._coords[bad1_idx]
+                b2x, b2y = self._coords[bad2_idx]
+                states.append((ax, ay, gx, gy, b1x, b1y, b2x, b2y))
         return states
 
     def get_actions(self, state):
@@ -392,25 +397,13 @@ class PolicyIteration:
 
     def _obs_to_state(self, obs: Any) -> State:
         """Convert environment observation to MDP state tuple.
-
-        Supports two observation formats used in earlier code variants:
-        - dict with keys 'agent', 'goal', 'walls' (current corrected env)
-        - tuple (agent, goal, walls) where walls is a list of two tuples
+        Canonicalize the two bad cells into a deterministic order so they match
+        the unordered pair used by GridWorld.get_states().
         """
-        # agent and goal
         if isinstance(obs, dict):
             agent = obs["agent"]
             goal = obs["goal"]
             walls = obs["walls"]
-            # walls might be numpy array shape (2,2) or list of tuples
-            if isinstance(walls, np.ndarray):
-                b1 = tuple(int(x) for x in walls[0])
-                b2 = tuple(int(x) for x in walls[1])
-            else:
-                b1, b2 = walls[0], walls[1]
-        else:
-            # assume tuple (agent, goal, walls)
-            agent, goal, walls = obs
             if isinstance(walls, np.ndarray):
                 b1 = tuple(int(x) for x in walls[0])
                 b2 = tuple(int(x) for x in walls[1])
@@ -421,7 +414,14 @@ class PolicyIteration:
         gx, gy = int(goal[0]), int(goal[1])
         b1x, b1y = int(b1[0]), int(b1[1])
         b2x, b2y = int(b2[0]), int(b2[1])
-        return (ax, ay, gx, gy, b1x, b1y, b2x, b2y)
+
+        # canonicalize order by flattened index so (b1,b2) is consistent
+        idx1 = b1x * self.mdp.width + b1y
+        idx2 = b2x * self.mdp.width + b2y
+        if idx1 <= idx2:
+            return (ax, ay, gx, gy, b1x, b1y, b2x, b2y)
+        else:
+            return (ax, ay, gx, gy, b2x, b2y, b1x, b1y)
 
     def run_episode(self, env: GridMazeEnv, max_steps: int = 100, render: bool = False) -> Tuple[float, int]:
         """Run one episode in the environment following the learned policy.
@@ -456,18 +456,18 @@ class PolicyIteration:
 # Example usage
 # -------------------
 if __name__ == "__main__":
-    env = GridMazeEnv(grid_size=5, render_mode=None)
+    env = GridMazeEnv(grid_size=5, render_mode="human")
     mdp = GridWorld(env)
 
-    solver = PolicyIteration(mdp, gamma=0.99, theta=1e-6)
-    policy, V = solver.run()
+    #solver = PolicyIteration(mdp, gamma=0.99, theta=1e-6)
+    #policy, V = solver.run()
 
     # save model
-    solver.save_model("learned_policy.pkl")
+    #solver.save_model("learned_policy.pkl")
 
     # create a fresh solver, load model and run an episode
-    #solver2 = PolicyIteration(mdp, gamma=0.99, theta=1e-6)#
-    #solver2.load_model("learned_policy.pkl")
+    solver2 = PolicyIteration(mdp, gamma=0.99, theta=1e-6)#
+    solver2.load_model("learned_policy.pkl")
 
-    #total_reward, steps = solver2.run_episode(env, max_steps=100, render=True)
-    #print(f"Episode finished: total_reward={total_reward}, steps={steps}")
+    total_reward, steps = solver2.run_episode(env, max_steps=100, render=True)
+    print(f"Episode finished: total_reward={total_reward}, steps={steps}")
